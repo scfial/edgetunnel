@@ -2,6 +2,20 @@
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io', EDT_版本号 = Number(String(Version).replace(/\D+/g, ''));
+// IP库源默认映射：KV 独立键 iplib.json 可覆盖（管理页"IP库源编辑"面板在线改）
+const 默认IP库映射 = {
+	'bestcf-all': 'https://bestcf.pages.dev/domain/all.txt',
+	'bestcf-asia': 'https://bestcf.pages.dev/domain/Domain-Asia.txt',
+	'vps789-top100': 'https://bestcf.pages.dev/vps789/top100.txt',
+};
+// 读取生效的IP库映射：优先 KV 的 iplib.json，非法/为空时用默认；值支持 "名称":"URL" 或 "名称":{"url":"...","label":"显示名"}
+async function 读取IP库映射(env) {
+	try {
+		const m = JSON.parse(await env.KV.get('iplib.json') || 'null');
+		if (m && typeof m === 'object' && !Array.isArray(m) && Object.keys(m).length) return m;
+	} catch { }
+	return 默认IP库映射;
+}
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
@@ -53,13 +67,10 @@ export default {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
 			缓存SOCKS5白名单 = SOCKS5白名单;
 		} else SOCKS5白名单 = 缓存SOCKS5白名单;
-				if (访问路径.startsWith('ip-lib/')) {// IP库源：抓取远程列表，域名经 DoH 解析为纯IP后输出（供管理页"IP库导入→测速"使用）
-			const IP库映射 = {
-				'bestcf-all': 'https://bestcf.pages.dev/domain/all.txt',
-				'bestcf-asia': 'https://bestcf.pages.dev/domain/Domain-Asia.txt',
-				'vps789-top100': 'https://bestcf.pages.dev/vps789/top100.txt',
-			};
-			const 源URL = IP库映射[访问路径.slice(7)];
+		if (访问路径.startsWith('ip-lib/')) {// IP库源：抓取远程列表，域名经 DoH 解析为纯IP后输出（供管理页"IP库导入→测速"使用）
+			const IP库映射 = await 读取IP库映射(env); // 独立KV键 iplib.json，缺省用内置三库
+			const 条目 = IP库映射[访问路径.slice(7)];
+			const 源URL = typeof 条目 === 'string' ? 条目 : 条目?.url;
 			if (!源URL) return new Response('未知IP库', { status: 404 });
 			try {
 				const 行列表 = (await (await fetch(源URL)).text()).split(/\r?\n/).map(l => l.trim())
@@ -262,6 +273,15 @@ export default {
 								console.error('保存配置失败:', error);
 								return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
+						} else if (访问路径 === 'admin/iplib.json') { // 保存IP库映射配置（独立KV键）
+							try {
+								const 新映射 = await request.json();
+								if (!新映射 || typeof 新映射 !== 'object' || Array.isArray(新映射)) return new Response(JSON.stringify({ error: '格式错误，需为 {"名称":"URL"} 的JSON对象' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+								await env.KV.put('iplib.json', JSON.stringify(新映射, null, 2));
+								return new Response(JSON.stringify({ success: true, message: 'IP库映射已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							} catch (error) {
+								return new Response(JSON.stringify({ error: '保存IP库映射失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							}
 						} else if (访问路径 === 'admin/cf.json') { // 保存cf.json配置
 							try {
 								const newConfig = await request.json();
@@ -317,6 +337,8 @@ export default {
 						} else return new Response(JSON.stringify({ error: '不支持的POST请求路径' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (访问路径 === 'admin/config.json') {// 处理 admin/config.json 请求，返回JSON
 						return new Response(JSON.stringify(config_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
+					} else if (访问路径 === 'admin/iplib.json') {// 返回IP库映射（独立KV键）
+						return new Response(JSON.stringify(await 读取IP库映射(env), null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (区分大小写访问路径 === 'admin/ADD.txt') {// 处理 admin/ADD.txt 请求，返回本地优选IP
 						let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
@@ -326,14 +348,40 @@ export default {
 					}
 
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
-										// 拦截管理页HTML，把内置IP库下拉替换为 bestcf 三库（经本站 /ip-lib/ 接口输出纯IP）
+					// 拦截管理页HTML：IP库下拉按 KV 独立键 iplib.json 动态生成（经本站 /ip-lib/ 接口输出纯IP），并注入"IP库源编辑"面板
+					const IP库映射 = await 读取IP库映射(env);
 					const 管理页响应 = await fetch(Pages静态页面 + '/admin' + url.search);
 					let 管理页HTML = await 管理页响应.text();
-					管理页HTML = 管理页HTML.replace(/const IP_LIBRARIES = \[[\s\S]*?\];/, `const IP_LIBRARIES = ${JSON.stringify([
-						{ label: "BestCF全网列表v4", family: "ipv4", url: "/ip-lib/bestcf-all" },
-						{ label: "BestCF亚洲列表v4", family: "ipv4", url: "/ip-lib/bestcf-asia" },
-						{ label: "VPS789优选TOP100", family: "ipv4", url: "/ip-lib/vps789-top100" },
-					])};`);
+					const 新IP库 = Object.entries(IP库映射).map(([键, 条目]) => (typeof 条目 === 'string')
+						? { label: 键, family: 'ipv4', url: '/ip-lib/' + 键 }
+						: { label: 条目.label || 键, family: 条目.family || 'ipv4', url: '/ip-lib/' + 键 });
+					管理页HTML = 管理页HTML.replace(/const IP_LIBRARIES = \[[\s\S]*?\];/, `const IP_LIBRARIES = ${JSON.stringify(新IP库)};`);
+					const 映射JSON转义 = JSON.stringify(IP库映射, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+					const 编辑面板 = `
+								<details class="settings-block advanced-settings">
+									<summary class="advanced-settings-summary"><span class="advanced-settings-copy"><span class="advanced-settings-title">IP库源编辑（存KV的iplib.json，保存后刷新页面生效）</span></span></summary>
+									<div style="padding:12px">
+										<textarea id="ipLibMapInput" style="width:100%;min-height:130px;font-family:monospace;box-sizing:border-box">${映射JSON转义}</textarea>
+										<div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+											<button class="btn secondary" type="button" onclick="__saveIpLibMap()">保存IP库</button>
+											<span id="ipLibSaveStatus" class="muted"></span>
+										</div>
+									</div>
+								</details>
+								<script>
+								async function __saveIpLibMap(){
+									const st = document.getElementById('ipLibSaveStatus');
+									try {
+										const map = JSON.parse(document.getElementById('ipLibMapInput').value);
+										if (!map || typeof map !== 'object' || Array.isArray(map)) throw new Error('必须是 {"名称":"URL"} 的JSON对象');
+										const r = await fetch('/admin/iplib.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(map) });
+										const res = await r.json();
+										if (!r.ok) throw new Error(res.error || ('HTTP ' + r.status));
+										st.textContent = '已保存，刷新页面后下拉列表生效';
+									} catch (e) { st.textContent = '保存失败: ' + e.message; }
+								}
+								</script>`;
+					管理页HTML = 管理页HTML.replace('<details class="settings-block advanced-settings">', 编辑面板 + '\n\t\t\t\t\t\t\t\t<details class="settings-block advanced-settings">');
 					const 管理页响应头 = new Headers(管理页响应.headers);
 					管理页响应头.delete('content-encoding'); // body 已解码，避免压缩头不匹配
 					管理页响应头.delete('content-length');
